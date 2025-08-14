@@ -1,0 +1,148 @@
+name: SMS Reminders Automation (Optimized)
+
+on:
+  schedule:
+    # Run every 5 minutes (GitHub minimum)
+    - cron: '*/5 * * * *'
+    # Additional staggered schedules for better coverage
+    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 * * * *'
+    - cron: '4,9,14,19,24,29,34,39,44,49,54,59 * * * *'
+  
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Test mode (manual trigger)'
+        required: false
+        default: 'false'
+        type: boolean
+      force_run:
+        description: 'Force immediate run'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  send-reminders:
+    runs-on: ubuntu-latest
+    
+    # Prevent overlapping runs
+    concurrency:
+      group: sms-reminders
+      cancel-in-progress: true
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup environment
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        FUNCTION_URL: ${{ secrets.SUPABASE_FUNCTION_URL }}
+      run: |
+        echo "🕐 Starting SMS Reminder Check..."
+        echo "📅 Current time: $(date)"
+        echo "🔄 Run type: ${{ github.event_name }}"
+        echo "📊 Event schedule: ${{ github.event.schedule }}"
+        
+        # Test mode for manual triggers
+        if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
+          echo "🧪 Test mode enabled - manual trigger"
+          FUNCTION_URL="${FUNCTION_URL}?manual=true"
+        fi
+        
+        # Force run mode
+        if [ "${{ github.event.inputs.force_run }}" = "true" ]; then
+          echo "🚀 Force run mode enabled"
+          FUNCTION_URL="${FUNCTION_URL}?force=true"
+        fi
+        
+        echo "🔗 Function URL: ${FUNCTION_URL}"
+    
+    - name: Send SMS Reminders
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        FUNCTION_URL: ${{ secrets.SUPABASE_FUNCTION_URL }}
+      run: |
+        # Retry logic for better reliability
+        max_retries=3
+        retry_count=0
+        
+        while [ $retry_count -lt $max_retries ]; do
+          echo "🔄 Attempt $((retry_count + 1)) of $max_retries"
+          
+          # Call the Edge Function with timeout
+          response=$(timeout 30s curl -s -w "\n%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${SERVICE_ROLE_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            "${FUNCTION_URL}")
+          
+          # Check if curl succeeded
+          if [ $? -eq 0 ]; then
+            # Extract response body and status code
+            http_code=$(echo "$response" | tail -n1)
+            response_body=$(echo "$response" | head -n -1)
+            
+            echo "📊 HTTP Status: $http_code"
+            echo "📊 Response: $response_body"
+            
+            # Check if successful
+            if [ "$http_code" -eq 200 ]; then
+              echo "✅ SMS Reminder function executed successfully!"
+              
+              # Parse results if response is valid JSON
+              if echo "$response_body" | jq -e . >/dev/null 2>&1; then
+                student_sent=$(echo "$response_body" | jq -r '.results.studentReminders.sent // 0')
+                student_failed=$(echo "$response_body" | jq -r '.results.studentReminders.failed // 0')
+                captain_sent=$(echo "$response_body" | jq -r '.results.captainReminders.sent // 0')
+                captain_failed=$(echo "$response_body" | jq -r '.results.captainReminders.failed // 0')
+                
+                echo "📱 Student Reminders: $student_sent sent, $student_failed failed"
+                echo "👨‍🏫 Captain Reminders: $captain_sent sent, $captain_failed failed"
+              fi
+              
+              echo "✅ SMS Reminder automation completed!"
+              break  # Success, exit retry loop
+              
+            else
+              echo "❌ SMS Reminder function failed with status: $http_code"
+              echo "📝 Error details: $response_body"
+              
+              # Retry on 5xx errors (server issues)
+              if [ "$http_code" -ge 500 ] && [ $retry_count -lt $((max_retries - 1)) ]; then
+                echo "🔄 Retrying in 10 seconds due to server error..."
+                sleep 10
+                retry_count=$((retry_count + 1))
+                continue
+              else
+                echo "❌ Max retries reached or client error, exiting"
+                exit 1
+              fi
+            fi
+          else
+            echo "❌ Curl failed or timed out"
+            retry_count=$((retry_count + 1))
+            
+            if [ $retry_count -lt $max_retries ]; then
+              echo "🔄 Retrying in 10 seconds..."
+              sleep 10
+            else
+              echo "❌ Max retries reached, exiting"
+              exit 1
+            fi
+          fi
+        done
+    
+    - name: Notify on Failure
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#general'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
